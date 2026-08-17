@@ -1,0 +1,831 @@
+#!/usr/bin/env python3
+"""Phase 3.1.1 browser regression QA for timer hotfixes and the original twelve bugs."""
+from __future__ import annotations
+
+import json
+from playwright.sync_api import sync_playwright
+from browser_qa import build_html
+
+
+def stored_state(page):
+    return page.evaluate("JSON.parse(JSON.parse(localStorage.getItem('aram-planner-store-v5')).payload)")
+
+
+def run() -> dict:
+    page_errors: list[str] = []
+    console_errors: list[str] = []
+    checks: dict[str, bool] = {}
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            headless=True,
+            executable_path="/usr/bin/chromium",
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        context = browser.new_context(viewport={"width": 390, "height": 844}, device_scale_factor=1)
+        page = context.new_page()
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+        page.on("console", lambda message: console_errors.append(message.text) if message.type == "error" else None)
+        page.set_content(build_html(), wait_until="domcontentloaded")
+        page.wait_for_function("document.documentElement.dataset.appReady === 'true'", timeout=15_000)
+        # Install deterministic completion-feedback fakes before the first user activation.
+        page.evaluate("""
+        (() => {
+          window.__timerFeedback = { sound: false, vibration: null, notification: null };
+          class FakeAudioContext {
+            constructor() { this.currentTime = 0; this.destination = {}; }
+            resume() { return Promise.resolve(); }
+            createOscillator() {
+              return {
+                frequency: { setValueAtTime() {} },
+                connect() {},
+                start() { window.__timerFeedback.sound = true; },
+                stop() {}
+              };
+            }
+            createGain() {
+              return {
+                gain: { setValueAtTime() {}, exponentialRampToValueAtTime() {} },
+                connect() {}
+              };
+            }
+          }
+          Object.defineProperty(window, 'AudioContext', { value: FakeAudioContext, configurable: true });
+          Object.defineProperty(window, 'webkitAudioContext', { value: FakeAudioContext, configurable: true });
+          Object.defineProperty(navigator, 'vibrate', {
+            value: pattern => { window.__timerFeedback.vibration = pattern; return true; },
+            configurable: true
+          });
+          class FakeAudio {
+            constructor() { this.currentTime = 0; this.preload = 'auto'; }
+            play() { window.__timerFeedback.sound = true; return Promise.resolve(); }
+            pause() {}
+          }
+          Object.defineProperty(window, 'Audio', { value: FakeAudio, configurable: true });
+          class FakeNotification {
+            static permission = 'granted';
+            constructor(title, options) { window.__timerFeedback.notification = { title, options }; }
+          }
+          Object.defineProperty(window, 'Notification', { value: FakeNotification, configurable: true });
+        })();
+        """)
+        page.wait_for_timeout(250)
+        if page.locator('#onboarding-content').count():
+            page.click('#onboarding-skip')
+
+        page.click('[data-view-target="more"]')
+        page.click('[data-open-sheet="settings"]')
+        page.wait_for_selector('#settings-notifications')
+        if page.locator('#settings-notifications').get_attribute('aria-checked') != 'true':
+            page.click('#settings-notifications')
+        page.click('#sheet-close')
+
+        # BUG 1 + BUG 4: primary titles are not duplicated and empty stats explain the state.
+        title_pairs = {
+            "calendar": "#calendar-heading",
+            "focus": "#focus-heading",
+            "stats": "#stats-heading",
+            "more": "#more-heading",
+        }
+        duplicate_free = True
+        for view, heading in title_pairs.items():
+            page.click(f'[data-view-target="{view}"]')
+            duplicate_free &= page.locator("#page-title").inner_text().strip() != page.locator(heading).inner_text().strip()
+        checks["duplicate_titles"] = duplicate_free
+        page.click('[data-view-target="stats"]')
+        checks["empty_statistics"] = page.locator("#stats-rings .stat-empty-card").count() == 3 and "هنوز جلسه تمرکزی" in page.locator("#stats-rings").inner_text()
+
+        # BUG 6 + BUG 10 + BUG 5: Jalali-first date input, Persian digits and visible edit action.
+        page.click('[data-view-target="home"]')
+        page.click("#quick-add")
+        page.wait_for_selector("#quick-form .jalali-date-input")
+        checks["jalali_date_picker"] = (
+            page.locator("#quick-date").get_attribute("type") == "hidden"
+            and "/" in page.locator("#quick-form .jalali-date-input").first.input_value()
+            and "میلادی:" in page.locator("#quick-form .jalali-date-secondary").first.inner_text()
+        )
+        page.fill("#quick-title", "کار رگرسیون")
+        duration = page.locator("#quick-duration")
+        duration.focus()
+        page.keyboard.press("Control+A")
+        page.keyboard.insert_text("۴۵")
+        page.fill("#quick-time", "۰۹:۳۰")
+        checks["persian_numeric_input"] = duration.input_value() == "45" and page.locator("#quick-time").input_value() == "09:30"
+        page.click("#quick-form .primary-button")
+        page.wait_for_selector(".timeline-item")
+        checks["discoverable_task_edit"] = page.locator(".timeline-edit").is_visible()
+        page.click(".timeline-edit")
+        page.wait_for_selector("#task-form")
+        checks["task_edit_action"] = "ویرایش کار" in page.locator("#sheet-title").inner_text()
+        page.wait_for_timeout(360)
+
+        # BUG 11 + BUG 12: close icon optical centering and selection policy.
+        close_box = page.locator("#sheet-close").bounding_box()
+        icon_box = page.locator("#sheet-close svg").bounding_box()
+        checks["modal_close_alignment"] = bool(close_box and icon_box and abs((close_box["x"] + close_box["width"] / 2) - (icon_box["x"] + icon_box["width"] / 2)) < 1 and abs((close_box["y"] + close_box["height"] / 2) - (icon_box["y"] + icon_box["height"] / 2)) < 1)
+        checks["text_selection"] = page.evaluate("""
+          getComputedStyle(document.body).userSelect === 'none'
+          && getComputedStyle(document.querySelector('#task-title')).userSelect === 'text'
+        """)
+        page.click("#sheet-close")
+        page.dispatch_event(".timeline-item", "pointerdown", {"pointerId": 1, "clientX": 310, "clientY": 300, "pointerType": "touch"})
+        page.dispatch_event(".timeline-item", "pointermove", {"pointerId": 1, "clientX": 220, "clientY": 303, "pointerType": "touch"})
+        page.dispatch_event(".timeline-item", "pointerup", {"pointerId": 1, "clientX": 220, "clientY": 303, "pointerType": "touch"})
+        page.wait_for_selector("#task-form")
+        checks["swipe_task_edit"] = "ویرایش کار" in page.locator("#sheet-title").inner_text()
+        page.click("#sheet-close")
+
+        # Primary calendar remains Jalali, Gregorian is only secondary.
+        page.click('[data-view-target="calendar"]')
+        checks["jalali_primary_calendar"] = bool(page.locator("#calendar-heading").inner_text().strip() and page.locator("#gregorian-month").inner_text().strip() and "ماه جلالی" in page.locator('[data-view="calendar"] .section-kicker').first.inner_text())
+
+        # BUG 2/3/8 + 3.1.1: exact duration, HH:MM:SS ordering, continuous progress and clean reset.
+        page.click('[data-view-target="focus"]')
+        page.click("[data-custom-timer]")
+        page.wait_for_selector("#custom-timer-form")
+        hour_box = page.locator("#custom-hours").bounding_box()
+        minute_box = page.locator("#custom-minutes").bounding_box()
+        second_box = page.locator("#custom-seconds").bounding_box()
+        page.fill("#custom-hours", "۰۱")
+        page.fill("#custom-minutes", "۰۲")
+        page.fill("#custom-seconds", "۰۳")
+        page.click("#custom-timer-form .primary-button")
+        checks["custom_hours_minutes_seconds"] = (
+            page.locator("#timer-display").inner_text() == "۰۱:۰۲:۰۳"
+            and stored_state(page)["runtime"]["timer"]["durationSeconds"] == 3723
+            and stored_state(page)["runtime"]["timer"]["durationSource"] == "custom"
+        )
+        checks["custom_duration_direction"] = bool(
+            hour_box and minute_box and second_box
+            and hour_box["x"] < minute_box["x"] < second_box["x"]
+        )
+
+        page.click("[data-custom-timer]")
+        page.fill("#custom-hours", "۰")
+        page.fill("#custom-minutes", "۰")
+        page.fill("#custom-seconds", "۰۳")
+        page.click("#custom-timer-form .primary-button")
+        page.wait_for_function("() => document.querySelector('#timer-display')?.textContent === '۰۰:۰۳' && JSON.parse(JSON.parse(localStorage.getItem('aram-planner-store-v5')).payload).runtime.timer.durationSeconds === 3", timeout=3_000)
+        checks["custom_short_duration"] = page.locator("#timer-display").inner_text() == "۰۰:۰۳" and stored_state(page)["runtime"]["timer"]["durationSeconds"] == 3
+
+        page.click("#timer-start")
+        page.wait_for_timeout(550)
+        running_progress = float(page.locator("#focus-ring").evaluate("node => getComputedStyle(node).getPropertyValue('--progress') || node.style.getPropertyValue('--progress')"))
+        page.click("#timer-pause")
+        paused_progress = float(page.locator("#focus-ring").evaluate("node => node.style.getPropertyValue('--progress')"))
+        page.wait_for_timeout(450)
+        paused_later = float(page.locator("#focus-ring").evaluate("node => node.style.getPropertyValue('--progress')"))
+        page.click("#timer-start")
+        page.wait_for_timeout(350)
+        resumed_progress = float(page.locator("#focus-ring").evaluate("node => node.style.getPropertyValue('--progress')"))
+        checks["real_elapsed_progress"] = 0 < running_progress < 95
+        checks["pause_resume_continuity"] = abs(paused_progress - paused_later) < 0.2 and resumed_progress > paused_progress
+        page.click("#timer-stop")
+        page.wait_for_timeout(180)
+        reset_progress = float(page.locator("#focus-ring").evaluate("node => node.style.getPropertyValue('--progress')"))
+        checks["smooth_reset"] = reset_progress == 0 and not page.locator("#focus-ring").evaluate("node => node.classList.contains('timer-complete')")
+
+        # BUG 7 + BUG 9 + 3.1.1: completion is never silent and custom work timers never launch a preset.
+        page.click('[data-timer-mode="work"]')
+        page.click("[data-custom-timer]")
+        page.fill("#custom-hours", "۰")
+        page.fill("#custom-minutes", "۰")
+        page.fill("#custom-seconds", "۰۱")
+        page.click("#custom-timer-form .primary-button")
+        before_sessions = len(stored_state(page)["data"]["focusSessions"])
+        page.evaluate("""
+          window.__completionAnimated = false;
+          new MutationObserver(() => {
+            if (document.querySelector('#focus-ring').classList.contains('timer-complete')) window.__completionAnimated = true;
+          }).observe(document.querySelector('#focus-ring'), { attributes: true, attributeFilter: ['class'] });
+        """)
+        page.click("#timer-start")
+        page.wait_for_function("expected => JSON.parse(JSON.parse(localStorage.getItem('aram-planner-store-v5')).payload).data.focusSessions.length === expected + 1", arg=before_sessions, timeout=10_000)
+        feedback_during_animation = page.evaluate("({ feedback: window.__timerFeedback, announcement: document.querySelector('#timer-announcement').textContent, animated: window.__completionAnimated })")
+        after = stored_state(page)
+        page.wait_for_timeout(1200)
+        final = stored_state(page)
+        checks["completion_feedback"] = bool(
+            feedback_during_animation["feedback"]["sound"]
+            and feedback_during_animation["feedback"]["vibration"]
+            and feedback_during_animation["feedback"]["notification"]
+            and "به پایان رسید" in feedback_during_animation["announcement"]
+            and feedback_during_animation["animated"]
+        )
+        checks["no_unexpected_restart"] = (
+            after["runtime"]["timer"]["status"] == "idle"
+            and final["runtime"]["timer"]["status"] == "idle"
+            and final["runtime"]["timer"]["mode"] == "workbreak"
+            and final["runtime"]["timer"]["phase"] == "work"
+            and final["runtime"]["timer"]["durationSeconds"] == 1
+            and final["runtime"]["timer"]["durationSource"] == "custom"
+            and len(after["data"]["focusSessions"]) == before_sessions + 1
+            and len(final["data"]["focusSessions"]) == before_sessions + 1
+        )
+
+        # Requested broad regressions: nav, themes, RTL and persisted data remain functional.
+        for view in ["home", "calendar", "focus", "stats", "more", "home"]:
+            page.click(f'[data-view-target="{view}"]')
+        initial_theme = page.locator("html").get_attribute("data-theme")
+        page.click("#theme-toggle")
+        toggled_theme = page.locator("html").get_attribute("data-theme")
+        page.click("#theme-toggle")
+        checks["navigation_theme_rtl"] = initial_theme != toggled_theme and page.locator("html").get_attribute("dir") == "rtl" and page.locator(".bottom-nav").is_visible()
+        checks["persistence_storage"] = len(stored_state(page)["data"]["tasks"]) == 1 and len(stored_state(page)["data"]["focusSessions"]) == before_sessions + 1
+
+        checks["no_runtime_errors"] = not page_errors and not console_errors
+        result = {
+            "checks": checks,
+            "passed": sum(1 for value in checks.values() if value),
+            "total": len(checks),
+            "page_errors": page_errors,
+            "console_errors": console_errors,
+            "ok": all(checks.values()) and not page_errors and not console_errors,
+        }
+        browser.close()
+        return result
+
+
+if __name__ == "__main__":
+    output = run()
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+    raise SystemExit(0 if output["ok"] else 1)
+
+#!/usr/bin/env python3
+"""Browser-level contract QA for the Capacitor iOS bridge using a deterministic fake native plugin."""
+from __future__ import annotations
+import json
+from playwright.sync_api import sync_playwright
+from browser_qa import build_html
+
+FAKE_NATIVE = r'''
+<script>
+window.__aramNativeCalls = [];
+const record = (name, payload = null) => { window.__aramNativeCalls.push({ name, payload: payload ? structuredClone(payload) : null }); };
+globalThis.Capacitor = {
+  isNativePlatform: () => true,
+  getPlatform: () => 'ios',
+  Plugins: {
+    AramNativeTimer: {
+      async getCapabilities() { record('getCapabilities'); return { notificationsSupported:true, notificationPermission:'prompt', liveActivitiesSupported:true, liveActivitiesEnabledBySystem:true, hapticsSupported:true, soundPreviewSupported:true, iosVersion:'18.0' }; },
+      async requestNotificationPermission() { record('requestNotificationPermission'); this.getCapabilities = async () => ({ notificationsSupported:true, notificationPermission:'granted', liveActivitiesSupported:true, liveActivitiesEnabledBySystem:true, hapticsSupported:true, soundPreviewSupported:true, iosVersion:'18.0' }); return { permission:'granted' }; },
+      async openNotificationSettings() { record('openNotificationSettings'); },
+      async syncTimer(payload) { record('syncTimer', payload); },
+      async completeTimer(payload) { record('completeTimer', payload); },
+      async previewSound(payload) { record('previewSound', payload); },
+      async stopSoundPreview() { record('stopSoundPreview'); }
+    }
+  }
+};
+</script>
+'''
+
+def run():
+    html = build_html().replace('</head>', FAKE_NATIVE + '</head>')
+    errors, console = [], []
+    checks = {}
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True, executable_path='/usr/bin/chromium', args=['--no-sandbox','--disable-dev-shm-usage'])
+        page = browser.new_page(viewport={'width':390,'height':844})
+        page.on('pageerror', lambda e: errors.append(str(e)))
+        page.on('console', lambda m: console.append(m.text) if m.type == 'error' else None)
+        page.set_content(html, wait_until='domcontentloaded')
+        page.wait_for_function("document.documentElement.dataset.appReady === 'true'", timeout=15000)
+        page.wait_for_timeout(300)
+        if page.locator('#onboarding-content').count():
+            page.click('#onboarding-skip')
+            page.wait_for_timeout(150)
+
+        page.click('[data-view-target="more"]')
+        page.click('[data-open-sheet="settings"]')
+        page.wait_for_selector('#settings-live-activity')
+        checks['native_settings_visible'] = page.locator('#settings-live-activity').count() == 1 and page.locator('#settings-notifications').count() == 1
+        page.click('#settings-notifications')
+        page.wait_for_selector('#notification-enable')
+        page.click('#notification-enable')
+        page.wait_for_selector('#settings-timer-sound')
+        checks['contextual_permission'] = page.evaluate("window.__aramNativeCalls.some(x => x.name === 'requestNotificationPermission')")
+        page.select_option('#settings-timer-sound', 'chime')
+        page.wait_for_timeout(100)
+        checks['native_sound_preview'] = page.evaluate("window.__aramNativeCalls.some(x => x.name === 'previewSound' && x.payload.sound === 'chime')")
+        page.click('#sheet-close')
+
+        page.click('[data-view-target="focus"]')
+        page.click('[data-custom-timer]')
+        page.fill('#custom-hours','0'); page.fill('#custom-minutes','0'); page.fill('#custom-seconds','03')
+        page.click('#custom-timer-form .primary-button')
+        page.click('#timer-start')
+        page.wait_for_timeout(350)
+        page.click('#timer-pause')
+        page.wait_for_timeout(100)
+        page.click('#timer-start')
+        page.wait_for_timeout(100)
+        page.click('#timer-stop')
+        page.wait_for_timeout(200)
+        reasons = page.evaluate("window.__aramNativeCalls.filter(x => x.name === 'syncTimer').map(x => x.payload.reason)")
+        checks['lifecycle_sync'] = all(reason in reasons for reason in ['start','pause','resume','stop'])
+        syncs = page.evaluate("window.__aramNativeCalls.filter(x => x.name === 'syncTimer').map(x => x.payload)")
+        start = next((x for x in syncs if x['reason'] == 'start'), None)
+        checks['timestamp_payload'] = bool(start and start['timer']['expectedEndDate'] and start['timer']['sessionId'] and start['timer']['totalDurationSeconds'] == 3)
+        checks['no_runtime_errors'] = not errors and not console
+        browser.close()
+    return {'checks':checks,'page_errors':errors,'console_errors':console,'ok':all(checks.values())}
+
+if __name__ == '__main__':
+    result=run(); print(json.dumps(result, ensure_ascii=False, indent=2)); raise SystemExit(0 if result['ok'] else 1)
+
+#!/usr/bin/env python3
+"""Chromium smoke/stress QA without a web server.
+Requires Python Playwright and a Chromium executable.
+"""
+from __future__ import annotations
+
+import base64
+import json
+import re
+from pathlib import Path
+from playwright.sync_api import sync_playwright
+
+ROOT = Path(__file__).resolve().parents[1]
+MODULES = [
+    "app.js", "js/domain.js", "js/reports.js", "js/commands.js", "js/store.js",
+    "js/timer.js", "js/native-timer-bridge.js", "js/diagnostics.js", "js/developer-mode.js", "js/modules.js",
+    "js/module-commands.js", "js/onboarding.js", "js/module-ui.js",
+]
+
+def module_name(path: str) -> str:
+    return f"aram:{path}"
+
+def rewrite_imports(path: str, source: str) -> str:
+    parent = (ROOT / path).parent
+    def replace(match: re.Match[str]) -> str:
+        prefix, specifier, suffix = match.groups()
+        if not specifier.startswith("."):
+            return match.group(0)
+        resolved = (parent / specifier).resolve().relative_to(ROOT).as_posix()
+        return f"{prefix}{module_name(resolved)}{suffix}"
+    pattern = re.compile(r"((?:from\s*|import\s*)['\"])([^'\"]+)(['\"])")
+    return pattern.sub(replace, source)
+
+def data_url(text: str, mime: str = "text/javascript") -> str:
+    encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+def build_html() -> str:
+    html = (ROOT / "index.html").read_text(encoding="utf-8")
+    css = (ROOT / "styles.css").read_text(encoding="utf-8")
+    imports = {}
+    for path in MODULES:
+        source = rewrite_imports(path, (ROOT / path).read_text(encoding="utf-8"))
+        imports[module_name(path)] = data_url(source)
+    import_map = json.dumps({"imports": imports}, ensure_ascii=False)
+    html = re.sub(r'<link rel="stylesheet" href="styles\.css"\s*/?>', f"<style>{css}</style>", html)
+    html = re.sub(r'<script type="module" src="app\.js"></script>', '', html)
+    bootstrap = """
+    <script>
+    (() => {
+      const values = new Map();
+      const storage = {
+        getItem: key => values.has(key) ? values.get(key) : null,
+        setItem: (key, value) => values.set(String(key), String(value)),
+        removeItem: key => values.delete(String(key)),
+        clear: () => values.clear(),
+        key: index => [...values.keys()][index] ?? null,
+        get length() { return values.size; }
+      };
+      Object.defineProperty(globalThis, 'localStorage', { value: storage, configurable: true });
+    })();
+    </script>
+    """
+    module_boot = f'<script type="importmap">{import_map}</script><script type="module">import "aram:app.js";</script>'
+    return html.replace('</head>', f'{bootstrap}<script type="importmap">{import_map}</script></head>').replace('</body>', f'<script type="module">import "aram:app.js";</script></body>')
+
+def run() -> dict:
+    html = build_html()
+    page_errors: list[str] = []
+    console_errors: list[str] = []
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            headless=True,
+            executable_path="/usr/bin/chromium",
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        context = browser.new_context(viewport={"width": 390, "height": 844}, device_scale_factor=1)
+        page = context.new_page()
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+        page.on("console", lambda message: console_errors.append(message.text) if message.type == "error" else None)
+        page.set_content(html, wait_until="domcontentloaded")
+        page.wait_for_function("document.documentElement.dataset.appReady === 'true'", timeout=15_000)
+        page.wait_for_timeout(250)
+        if page.locator("#onboarding-content").count():
+            page.click("#onboarding-skip")
+
+        # Empty state and invalid required input.
+        page.click("#quick-add")
+        page.click("#quick-form .primary-button")
+        assert page.locator("#bottom-sheet").get_attribute("aria-hidden") == "false"
+        page.fill("#quick-title", "کار تست پایداری")
+        page.click("#quick-form .primary-button")
+        page.wait_for_selector(".timeline-item")
+        page.click(".timeline-status")
+
+        # Rapid navigation and theme switching.
+        for _ in range(12):
+            for name in ["calendar", "focus", "stats", "more", "home"]:
+                page.click(f'[data-view-target="{name}"]')
+        for _ in range(12):
+            page.click("#theme-toggle")
+
+        # Direction changes must not break behavior.
+        page.evaluate("document.documentElement.dir = 'ltr'")
+        page.click('[data-view-target="calendar"]')
+        page.evaluate("document.documentElement.dir = 'rtl'")
+        page.click('[data-view-target="more"]')
+
+        # Hidden developer mode and diagnostic inspector.
+        page.click('[data-open-sheet="settings"]')
+        for _ in range(5):
+            page.click("#app-version")
+        page.wait_for_selector("#developer-root")
+        page.click('[data-dev-tab="storage"]')
+        page.click("#refresh-debug")
+        assert page.locator("#developer-root").inner_text().find("LocalStorage") >= 0
+        page.keyboard.press("Escape")
+        assert page.locator("#bottom-sheet").get_attribute("aria-hidden") == "true"
+        assert not page.locator(".app-shell").evaluate("node => node.inert")
+
+        # Keyboard search shortcut and focus-trap escape.
+        page.keyboard.press("/")
+        page.wait_for_selector("#bottom-sheet.open")
+        page.keyboard.press("Tab")
+        page.keyboard.press("Escape")
+
+        # Reduced-motion path and oversized type should remain operable.
+        page.emulate_media(reduced_motion="reduce")
+        page.evaluate("document.documentElement.style.fontSize = '125%'")
+        page.click('[data-view-target="home"]')
+        assert page.locator("#quick-add").is_visible()
+        title_box = page.locator(".topbar > div:first-child").bounding_box()
+        action_box = page.locator(".top-actions").bounding_box()
+        heading_box = page.locator("#page-title").bounding_box()
+        eyebrow_box = page.locator("#jalali-date").bounding_box()
+        assert title_box and action_box and heading_box and eyebrow_box
+        action_right = action_box["x"] + action_box["width"]
+        assert action_right <= min(heading_box["x"], eyebrow_box["x"]) + 1
+
+        page.evaluate("document.documentElement.style.fontSize = ''")
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(2600)
+        page.screenshot(path="/mnt/data/aram-phase3-home-preview.png", full_page=False)
+        page.click("#theme-toggle")
+        page.screenshot(path="/mnt/data/aram-phase3-dark-preview.png", full_page=False)
+
+        storage_keys = page.evaluate("Array.from({length: localStorage.length}, (_, index) => localStorage.key(index))")
+        record_count = page.evaluate("JSON.parse(JSON.parse(localStorage.getItem('aram-planner-store-v5')).payload).data.tasks.length")
+        result = {
+            "page_errors": page_errors,
+            "console_errors": console_errors,
+            "storage_keys": storage_keys,
+            "task_count": record_count,
+            "developer_mode": True,
+            "rapid_navigation_cycles": 12,
+            "theme_switches": 13,
+            "ok": not page_errors and not console_errors and record_count == 1,
+        }
+        browser.close()
+        return result
+
+if __name__ == "__main__":
+    output = run()
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+    raise SystemExit(0 if output["ok"] else 1)
+
+#!/usr/bin/env python3
+"""Phase 3.3 module-system browser QA using an in-memory LocalStorage."""
+from __future__ import annotations
+
+import base64
+import json
+import re
+from pathlib import Path
+from playwright.sync_api import sync_playwright
+
+ROOT = Path(__file__).resolve().parents[1]
+MODULES = [
+    "app.js", "js/domain.js", "js/reports.js", "js/commands.js", "js/store.js",
+    "js/timer.js", "js/native-timer-bridge.js", "js/diagnostics.js", "js/developer-mode.js", "js/modules.js",
+    "js/module-commands.js", "js/onboarding.js", "js/module-ui.js",
+]
+
+
+def module_name(path: str) -> str:
+    return f"aram:{path}"
+
+
+def rewrite_imports(path: str, source: str) -> str:
+    parent = (ROOT / path).parent
+    def replace(match: re.Match[str]) -> str:
+        prefix, specifier, suffix = match.groups()
+        if not specifier.startswith("."):
+            return match.group(0)
+        resolved = (parent / specifier).resolve().relative_to(ROOT).as_posix()
+        return f"{prefix}{module_name(resolved)}{suffix}"
+    return re.sub(r"((?:from\s*|import\s*)['\"])([^'\"]+)(['\"])", replace, source)
+
+
+def data_url(text: str) -> str:
+    encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    return f"data:text/javascript;base64,{encoded}"
+
+
+def build_html(preload: dict[str, str] | None = None) -> str:
+    html = (ROOT / "index.html").read_text(encoding="utf-8")
+    css = (ROOT / "styles.css").read_text(encoding="utf-8")
+    imports = {
+        module_name(path): data_url(rewrite_imports(path, (ROOT / path).read_text(encoding="utf-8")))
+        for path in MODULES
+    }
+    import_map = json.dumps({"imports": imports}, ensure_ascii=False)
+    preloaded = json.dumps(preload or {}, ensure_ascii=False)
+    bootstrap = f"""
+    <script>
+    (() => {{
+      const initial = {preloaded};
+      const values = new Map(Object.entries(initial));
+      const storage = {{
+        getItem: key => values.has(String(key)) ? values.get(String(key)) : null,
+        setItem: (key, value) => values.set(String(key), String(value)),
+        removeItem: key => values.delete(String(key)),
+        clear: () => values.clear(),
+        key: index => [...values.keys()][index] ?? null,
+        get length() {{ return values.size; }}
+      }};
+      Object.defineProperty(globalThis, 'localStorage', {{ value: storage, configurable: true }});
+    }})();
+    </script>
+    """
+    html = re.sub(r'<link rel="stylesheet" href="styles\.css"\s*/?>', f"<style>{css}</style>", html)
+    html = re.sub(r'<script type="module" src="app\.js"></script>', '', html)
+    return html.replace('</head>', f'{bootstrap}<script type="importmap">{import_map}</script></head>').replace('</body>', '<script type="module">import "aram:app.js";</script></body>')
+
+
+def checksum(value: str) -> str:
+    h = 2166136261
+    for char in value:
+        h ^= ord(char)
+        h = (h * 16777619) & 0xFFFFFFFF
+    return f"{h:08x}"
+
+
+def encode_state(state: dict) -> str:
+    payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps({"version": 2, "checksum": checksum(payload), "payload": payload}, ensure_ascii=False, separators=(",", ":"))
+
+
+def v3_fixture() -> dict:
+    return {
+        "schemaVersion": 3,
+        "meta": {"storeId": "qa-v3", "revision": 7, "createdAt": "2026-01-01T00:00:00.000Z", "updatedAt": "2026-08-06T00:00:00.000Z"},
+        "settings": {"theme": "light", "autoContinue": False, "sound": True, "vibration": True, "workPreset": {"workMinutes": 50, "breakMinutes": 10}, "readingGoal": {"minutes": 20, "pages": 8}, "currentBookId": "book-v3"},
+        "data": {
+            "tasks": [], "taskEntries": [], "habits": [], "habitEntries": [], "notes": [],
+            "books": [{"id": "book-v3", "title": "کتاب مهاجرت", "author": "نویسنده", "totalPages": 300, "currentPage": 90, "archivedAt": None, "finishedAt": None, "createdAt": "2026-07-01T00:00:00.000Z", "updatedAt": "2026-08-01T00:00:00.000Z", "deletedAt": None}],
+            "readingSessions": [{"id": "reading-v3", "bookId": "book-v3", "date": "2026-08-06", "fromPage": 80, "toPage": 90, "pagesRead": 10, "durationSeconds": 1200, "startedAt": None, "endedAt": "2026-08-06T10:00:00.000Z", "notes": "جلسه قبلی", "createdAt": "2026-08-06T10:00:00.000Z", "updatedAt": "2026-08-06T10:00:00.000Z", "deletedAt": None}],
+            "universityItems": [{"id": "uni-v3", "moduleId": "university", "title": "پژوهش مهاجرت", "type": "research", "deadline": "2026-09-01", "progress": 35, "status": "in_progress", "notes": "داده قدیمی", "priority": "high", "estimatedHours": 12, "completedAt": None, "archivedAt": None, "createdAt": "2026-07-01T00:00:00.000Z", "updatedAt": "2026-08-01T00:00:00.000Z", "deletedAt": None}],
+            "focusSessions": [],
+            "screenTimeEntries": [{"id": "screen-v3", "date": "2026-08-06", "minutes": 75, "createdAt": "2026-08-06T00:00:00.000Z", "updatedAt": "2026-08-06T00:00:00.000Z", "deletedAt": None}],
+        },
+        "runtime": {"timer": {"mode": "focus", "phase": "focus", "status": "idle", "durationSeconds": 1500, "remainingSeconds": 1500}},
+    }
+
+
+def open_app(context, preload=None):
+    page = context.new_page()
+    page.set_default_timeout(7000)
+    errors: list[str] = []
+    console: list[str] = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.on("console", lambda message: console.append(message.text) if message.type == "error" else None)
+    page.set_content(build_html(preload), wait_until="domcontentloaded")
+    page.wait_for_function("document.documentElement.dataset.appReady === 'true'", timeout=15_000)
+    page.wait_for_timeout(300)
+    return page, errors, console
+
+
+def all_storage(page) -> dict[str, str]:
+    return page.evaluate("Object.fromEntries(Array.from({length: localStorage.length}, (_, i) => [localStorage.key(i), localStorage.getItem(localStorage.key(i))]))")
+
+
+def state(page) -> dict:
+    return page.evaluate("JSON.parse(JSON.parse(localStorage.getItem('aram-planner-store-v5')).payload)")
+
+
+def status(data: dict, module_id: str) -> str:
+    return next(item["status"] for item in data["settings"]["moduleConfigs"] if item["moduleId"] == module_id)
+
+
+def run() -> dict:
+    outcomes = {}
+    all_errors: list[str] = []
+    all_console: list[str] = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, executable_path="/usr/bin/chromium", args=["--no-sandbox", "--disable-dev-shm-usage"])
+        context = browser.new_context(viewport={"width": 390, "height": 844}, accept_downloads=True)
+
+        print("checkpoint:new-user", flush=True)
+        # New-user onboarding and partial-resume checkpoint.
+        page, errors, console = open_app(context)
+        all_errors += errors; all_console += console
+        page.wait_for_selector("#onboarding-content")
+        page.click("#onboarding-next")
+        page.click('[data-onboarding-module="reading"]')
+        partial = all_storage(page)
+        page.close()
+
+        page, errors, console = open_app(context, partial)
+        all_errors += errors; all_console += console
+        page.wait_for_selector("#onboarding-content")
+        assert "۲ از ۴" in page.locator("#onboarding-content").inner_text()
+        assert page.locator('[data-onboarding-module="reading"]').get_attribute("aria-pressed") == "true"
+        page.click('[data-onboarding-module="university"]')
+        page.click("#onboarding-next")
+        page.click('[data-use-case="mixed"]')
+        page.click("#onboarding-next")
+        assert "مطالعه" in page.locator("#onboarding-content").inner_text()
+        page.click("#onboarding-next")
+        data = state(page)
+        assert data["settings"]["modulePreferences"]["onboardingStatus"] == "completed"
+        assert status(data, "reading") == "active" and status(data, "university") == "active"
+        assert all(status(data, module_id) == "available" for module_id in ["screen-time", "work", "projects"])
+        outcomes["onboarding_resume_and_complete"] = True
+        outcomes["use_case_does_not_auto_activate"] = True
+
+        print("checkpoint:lifecycle", flush=True)
+        # Module Library lifecycle: pin, Today, hide/restore, deactivate, archive/reactivate.
+        page.click('[data-view-target="more"]')
+        assert "هنوز بخشی اضافه نکرده‌ای" not in page.locator("#feature-grid").inner_text()
+        outcomes["pinned_modules_do_not_show_empty_state"] = True
+        page.click('[data-open-module-library]')
+        page.click('[data-module-card="reading"] [data-module-manage]')
+        page.click("#module-pin")
+        page.click("#module-today")
+        page.click("#module-hide")
+        assert status(state(page), "reading") == "hidden"
+        page.click('[data-module-card="reading"] [data-module-primary]')
+        assert status(state(page), "reading") == "active"
+        page.click('[data-module-card="reading"] [data-module-manage]')
+        page.click("#module-deactivate")
+        assert status(state(page), "reading") == "available"
+        page.click('[data-module-card="reading"] [data-module-primary]')
+        page.click('[data-module-card="reading"] [data-module-manage]')
+        page.click("#module-archive")
+        assert status(state(page), "reading") == "archived"
+        page.click('[data-module-card="reading"] [data-module-primary]')
+        assert status(state(page), "reading") == "active"
+
+        # Accessible ordering changes the stored order and can be reversed.
+        initial_order = next(item["order"] for item in state(page)["settings"]["moduleConfigs"] if item["moduleId"] == "reading")
+        page.click('[data-module-card="reading"] [data-module-manage]')
+        page.click("#module-down")
+        moved_order = next(item["order"] for item in state(page)["settings"]["moduleConfigs"] if item["moduleId"] == "reading")
+        assert moved_order != initial_order
+        page.click("#module-up")
+        restored_order = next(item["order"] for item in state(page)["settings"]["moduleConfigs"] if item["moduleId"] == "reading")
+        assert restored_order == initial_order
+        outcomes["module_lifecycle"] = True
+
+        # Settings export/import round-trip restores module configuration safely.
+        page.keyboard.press("Escape")
+        page.click('[data-open-sheet="settings"]')
+        with page.expect_download() as export_info:
+            page.click("#export-data")
+        export_path = "/tmp/aram-phase33-ui-backup.json"
+        export_info.value.save_as(export_path)
+        page.keyboard.press("Escape")
+        page.click('[data-open-module-library]')
+        page.click('[data-module-card="reading"] [data-module-manage]')
+        page.click("#module-deactivate")
+        assert status(state(page), "reading") == "available"
+        page.keyboard.press("Escape")
+        page.click('[data-open-sheet="settings"]')
+        page.set_input_files("#import-data-file", export_path)
+        page.wait_for_function("JSON.parse(JSON.parse(localStorage.getItem('aram-planner-store-v5')).payload).settings.moduleConfigs.find(x => x.moduleId === 'reading').status === 'active'")
+        assert status(state(page), "reading") == "active"
+        outcomes["backup_import_roundtrip"] = True
+
+        page.click('[data-view-target="more"]')
+        page.click('[data-open-module-library]')
+        print("checkpoint:custom", flush=True)
+        # Custom module UI, Persian digits and Today integration.
+        page.click("#create-custom-module")
+        page.fill("#custom-module-name", "تمرین موسیقی 🎵")
+        page.fill("#custom-module-icon", "♫")
+        page.select_option("#custom-module-type", "time_tracker")
+        page.fill("#custom-module-goal", "۱۲۰")
+        page.fill("#custom-module-unit", "دقیقه")
+        page.check("#custom-module-today")
+        page.click("#custom-module-form .primary-button")
+        page.click("#add-custom-record")
+        page.fill("#custom-record-minutes", "۴۵")
+        page.fill("#custom-record-seconds", "۳۰")
+        page.fill("#custom-record-notes", "تمرین روزانه")
+        page.click("#custom-record-form .primary-button")
+        data = state(page)
+        custom = next(item for item in data["data"]["customModules"] if item["name"] == "تمرین موسیقی 🎵")
+        record = next(item for item in data["data"]["customModuleRecords"] if item["moduleId"] == custom["id"])
+        assert record["durationSeconds"] == 2730
+        page.keyboard.press("Escape")
+        page.click('[data-view-target="home"]')
+        assert 'تمرین موسیقی' in page.locator('#today-module-summaries').inner_text()
+        outcomes["custom_module_and_today"] = True
+
+        # Search identifies module source.
+        page.keyboard.press("/")
+        page.fill("#search-input", "تمرین روزانه")
+        assert "تمرین موسیقی" in page.locator("#search-results").inner_text()
+        page.keyboard.press("Escape")
+
+        # Permanent deletion is cancelable, creates a backup, and removes only the named custom namespace.
+        page.click('[data-view-target="more"]')
+        page.click('[data-open-module-library]')
+        page.click("#create-custom-module")
+        page.fill("#custom-module-name", "حذف آزمایشی")
+        page.fill("#custom-module-icon", "×")
+        page.select_option("#custom-module-type", "list")
+        page.click("#custom-module-form .primary-button")
+        page.click("#manage-current-module")
+        page.once("dialog", lambda dialog: dialog.dismiss())
+        with page.expect_download():
+            page.click("#delete-module-permanently")
+        assert any(item["name"] == "حذف آزمایشی" for item in state(page)["data"]["customModules"])
+        page.once("dialog", lambda dialog: dialog.accept("حذف آزمایشی"))
+        with page.expect_download():
+            page.click("#delete-module-permanently")
+        assert not any(item["name"] == "حذف آزمایشی" for item in state(page)["data"]["customModules"])
+        outcomes["permanent_delete_safety"] = True
+        page.close()
+
+        print("checkpoint:migration", flush=True)
+        # Existing-user v3 migration keeps specialized records and does not force onboarding.
+        preload = {"aram-planner-store-v3": encode_state(v3_fixture())}
+        page, errors, console = open_app(context, preload)
+        all_errors += errors; all_console += console
+        assert page.locator("#onboarding-content").count() == 0
+        data = state(page)
+        assert data["schemaVersion"] == 5
+        assert data["data"]["books"][0]["title"] == "کتاب مهاجرت"
+        assert data["data"]["universityItems"][0]["title"] == "پژوهش مهاجرت"
+        assert status(data, "reading") == "active" and status(data, "university") == "active" and status(data, "screen-time") == "active"
+        assert page.evaluate("localStorage.getItem('aram-planner-store-v3-migration-backup') !== null")
+        page.click('[data-view-target="more"]')
+        page.click('[data-open-module="reading"]')
+        assert "کتاب مهاجرت" in page.locator("#reading-manager").inner_text()
+        page.keyboard.press("Escape")
+        page.click('[data-open-module="university"]')
+        assert "پژوهش مهاجرت" in page.locator("#university-manager").inner_text()
+        outcomes["existing_migration_and_specialized_regression"] = True
+
+        print("checkpoint:hidden-search", flush=True)
+        # Hidden search is opt-in and clicking it opens management, not an editor.
+        page.keyboard.press("Escape")
+        page.click('[data-open-module-library]')
+        page.click('[data-module-card="reading"] [data-module-manage]')
+        page.click("#module-hide")
+        page.keyboard.press("Escape")
+        page.keyboard.press("/")
+        page.fill("#search-input", "کتاب مهاجرت")
+        assert "نتیجه‌ای پیدا نشد" in page.locator("#search-results").inner_text()
+        page.check("#search-hidden-modules")
+        assert "کتاب مهاجرت" in page.locator("#search-results").inner_text()
+        row_module = page.locator("#search-results .search-result").get_attribute("data-module-id")
+        page.click("#search-results .search-result")
+        assert "مدیریت بخش" in page.locator("#sheet-kicker").inner_text()
+        assert page.locator("#book-form").count() == 0
+        outcomes["hidden_search_safety"] = True
+        page.close()
+
+        print("checkpoint:skip", flush=True)
+        # Skip onboarding keeps all optional modules unavailable.
+        page, errors, console = open_app(context)
+        all_errors += errors; all_console += console
+        page.click("#onboarding-skip")
+        data = state(page)
+        assert data["settings"]["modulePreferences"]["onboardingStatus"] == "skipped"
+        assert all(status(data, module_id) == "available" for module_id in ["reading", "university", "screen-time", "work", "projects"])
+        outcomes["onboarding_skip"] = True
+        page.close()
+
+        browser.close()
+
+    return {
+        "checks": outcomes,
+        "page_errors": all_errors,
+        "console_errors": all_console,
+        "ok": all(outcomes.values()) and not all_errors and not all_console,
+    }
+
+
+if __name__ == "__main__":
+    result = run()
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    raise SystemExit(0 if result["ok"] else 1)
